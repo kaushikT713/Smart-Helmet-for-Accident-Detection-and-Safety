@@ -1,0 +1,217 @@
+/************************************************************
+ * Project: Accident Detection Smart Helmet
+ * Description: IoT-based safety helmet that detects accidents,
+ * monitors vital signs, and sends real-time alerts with GPS location.
+ * Hardware: ESP32, MPU6050, MAX30102, NEO-6M GPS, SW-420 Sensor
+ * Author: Team Smart Helmet
+ ************************************************************/
+
+#define BLYNK_TEMPLATE_ID "YOUR_BLYNK_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "Accident Detection Helmet"
+#define BLYNK_AUTH_TOKEN "YOUR_BLYNK_AUTH_TOKEN"
+
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <math.h>
+#include <HTTPClient.h>
+#include <time.h>
+
+// ------------------ Wi-Fi Credentials ------------------
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// ------------------ Telegram Credentials ------------------
+const char* TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN";  // Replace with your bot token
+const char* TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID";      // Replace with your chat ID
+
+// ------------------ Configuration ------------------
+String vehicleNumber = "XX-00-YY-0000";  // Replace with vehicle number or ID
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(1);
+MAX30105 particleSensor;
+
+// ------------------ Pins and Thresholds ------------------
+#define SW420_PIN 34
+#define HEART_RATE_PANIC 150
+#define HEART_RATE_SHOCK 50
+#define SPO2_LOW 94
+#define TILT_ANGLE_THRESHOLD 45
+#define IMPACT_THRESHOLD 5.0
+
+float prevAccel = 0;
+int preImpactHR = 0;
+int postImpactHR = 0;
+float lastLat = 0.0;
+float lastLng = 0.0;
+
+// ------------------ Setup Function ------------------
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  pinMode(SW420_PIN, INPUT);
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Connected to Wi-Fi!");
+
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+
+  // Connect to Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+  Serial.println("✅ Connected to Blynk!");
+
+  // Initialize MPU6050
+  Serial.print("Initializing MPU6050...");
+  if (!mpu.begin()) {
+    Serial.println(" ❌ MPU6050 not detected!");
+    while (1);
+  }
+  Serial.println(" ✅ MPU6050 Found!");
+
+  // Initialize GPS
+  GPS_Serial.begin(9600, SERIAL_8N1, 16, 17);
+
+  // Initialize MAX30102
+  Serial.print("Initializing MAX30102...");
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println(" ❌ MAX30102 not found!");
+    while (1);
+  }
+  particleSensor.setup();
+  Serial.println(" ✅ MAX30102 Found!");
+}
+
+// ------------------ Main Loop ------------------
+void loop() {
+  Blynk.run();
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float accel = sqrt(a.acceleration.x * a.acceleration.x +
+                     a.acceleration.y * a.acceleration.y +
+                     a.acceleration.z * a.acceleration.z);
+
+  float tiltAngle = atan2(a.acceleration.y, a.acceleration.z) * (180.0 / M_PI);
+
+  long irValue = particleSensor.getIR();
+  int heartRate = random(60, 110); // Simulated HR
+  int spo2 = random(95, 99);       // Simulated SpO2
+
+  float accelerationChange = fabs(accel - prevAccel);
+  prevAccel = accel;
+
+  bool tiltExceeded = fabs(tiltAngle) > TILT_ANGLE_THRESHOLD;
+  bool impactDetected = accelerationChange > IMPACT_THRESHOLD;
+  bool accidentDetected = tiltExceeded && impactDetected;
+
+  if (GPS_Serial.available()) {
+    gps.encode(GPS_Serial.read());
+    if (gps.location.isValid()) {
+      lastLat = gps.location.lat();
+      lastLng = gps.location.lng();
+    }
+  }
+
+  if (!accidentDetected) {
+    preImpactHR = heartRate;
+  }
+
+  if (accidentDetected) {
+    Serial.println("⚠ Accident Detected! Waiting 5s for post-impact HR...");
+    delay(5000);
+    postImpactHR = random(45, 160); // Simulated post-impact HR
+
+    bool panicHR = postImpactHR > HEART_RATE_PANIC;
+    bool shockHR = postImpactHR < HEART_RATE_SHOCK;
+    bool lowSpO2 = spo2 < SPO2_LOW;
+
+    float lat = gps.location.isValid() ? gps.location.lat() : lastLat;
+    float lng = gps.location.isValid() ? gps.location.lng() : lastLng;
+    String timeStr = getCurrentTimeString();
+    String gMaps = "https://www.google.com/maps/search/?api=1&query=" +
+                   String(lat, 6) + "," + String(lng, 6);
+
+    String message = "🚨 Emergency Alert 🚨\n";
+    message += "📅 Date/Time: " + timeStr + "\n";
+    message += "🚗 Vehicle: " + vehicleNumber + "\n";
+    message += "🛑 Crash Detected (Tilt & Impact)!\n";
+    message += "📊 HR Before: " + String(preImpactHR) + " BPM\n";
+    message += "📊 HR After 5s: " + String(postImpactHR) + " BPM\n";
+    if (panicHR) message += "⚠ Panic HR: " + String(postImpactHR) + " BPM\n";
+    if (shockHR) message += "⚠ Shock/Unconscious: " + String(postImpactHR) + " BPM\n";
+    if (lowSpO2) message += "🫁 Low SpO2: " + String(spo2) + "%\n";
+    message += "📍 Location: " + String(lat, 6) + ", " + String(lng, 6) + "\n";
+    message += "🔗 Maps: " + gMaps;
+
+    Serial.println("Sending Telegram Alert...");
+    Serial.println(message);
+
+    Blynk.virtualWrite(V0, lat);
+    Blynk.virtualWrite(V1, lng);
+    Blynk.virtualWrite(V3, postImpactHR);
+    Blynk.virtualWrite(V4, spo2);
+    Blynk.logEvent("alert", "🚨 Emergency Alert! Accident Detected!");
+
+    sendTelegramAlert(message);
+  }
+
+  delay(1000);
+}
+
+// ------------------ Helper Functions ------------------
+String getCurrentTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "N/A";
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+void sendTelegramAlert(String msg) {
+  String url = "https://api.telegram.org/bot" + String(TELEGRAM_BOT_TOKEN) +
+               "/sendMessage?chat_id=" + String(TELEGRAM_CHAT_ID) +
+               "&text=" + urlencode(msg);
+
+  HTTPClient http;
+  http.begin(url);
+  int httpResponseCode = http.GET();
+  if (httpResponseCode > 0) {
+    Serial.println("✅ Telegram alert sent!");
+  } else {
+    Serial.println("❌ Telegram failed: " + http.errorToString(httpResponseCode));
+  }
+  http.end();
+}
+
+String urlencode(String str) {
+  String encoded = "";
+  char c;
+  char code0, code1;
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c)) {
+      encoded += c;
+    } else {
+      encoded += '%';
+      code0 = (c >> 4) & 0xF;
+      code1 = c & 0xF;
+      encoded += char(code0 > 9 ? code0 + 55 : code0 + 48);
+      encoded += char(code1 > 9 ? code1 + 55 : code1 + 48);
+    }
+  }
+  return encoded;
+}
